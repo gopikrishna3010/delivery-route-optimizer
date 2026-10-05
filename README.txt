@@ -11,11 +11,16 @@ How to use it
 * Paste your start point and every parcel location. Each box accepts a latitude,
   longitude pair, labelled coordinates, a Google Maps link containing coordinates,
   or a complete address.
+* For 100+ deliveries, use Bulk paste 100+ parcel locations. Put one location on
+  each line. Use `Customer name | location` when you want to name a stop, for
+  example: `Parcel 27 | 17.4069790, 78.5874740`. The app supports up to 250
+  parcels in one batch.
 * Tap Check locations. The app shows the chosen point on a map and provides an
   Open in Google Maps button for every location. Verify it before route planning.
 * Tap Find best road route to calculate the delivery sequence, road distance, and
   driving-time estimate. Up to eight stops are optimized exactly; more use a fast
-  nearest-stop method.
+  nearest-stop method. Large batches are split into road-based groups so the free
+  routing service can handle 100+ stops reliably.
 
 Free by default
 ---------------

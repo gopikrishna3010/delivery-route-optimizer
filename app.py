@@ -36,6 +36,9 @@ st.set_page_config(
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org"
+MAX_TOTAL_PARCELS = 250
+ROAD_MATRIX_GROUP_SIZE = 80
+ROAD_LINE_GROUP_SIZE = 80
 NUMBER = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)"
 LAT_LABEL = re.compile(rf"\b(?:lat|latitude)\b\s*(?:[:=]|is)?\s*\(?\s*({NUMBER})", re.I)
 LON_LABEL = re.compile(rf"\b(?:lng|lon|long|longitude)\b\s*(?:[:=]|is)?\s*\(?\s*({NUMBER})", re.I)
@@ -249,8 +252,8 @@ def optimise_stop_order(distances: list[list[float]]) -> tuple[list[int], str]:
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
-def road_line(coordinate_pairs: tuple[tuple[float, float], ...]) -> tuple[list[list[float]], bool]:
-    """Return a driveable OSRM line.  A straight display line is only a fallback."""
+def road_line_segment(coordinate_pairs: tuple[tuple[float, float], ...]) -> tuple[list[list[float]], bool]:
+    """Return one driveable OSRM line. A straight line is only a fallback."""
     encoded_points = ";".join(f"{longitude:.7f},{latitude:.7f}" for latitude, longitude in coordinate_pairs)
     try:
         response = requests.get(
@@ -264,6 +267,91 @@ def road_line(coordinate_pairs: tuple[tuple[float, float], ...]) -> tuple[list[l
         return coordinates, True
     except (requests.RequestException, IndexError, KeyError, TypeError):
         return [[longitude, latitude] for latitude, longitude in coordinate_pairs], False
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def road_line(coordinate_pairs: tuple[tuple[float, float], ...]) -> tuple[list[list[float]], bool]:
+    """Build a route line in small requests so 100+ stops remain usable."""
+    if len(coordinate_pairs) <= ROAD_LINE_GROUP_SIZE:
+        return road_line_segment(coordinate_pairs)
+
+    full_line: list[list[float]] = []
+    all_segments_are_road = True
+    # Each part overlaps the prior part's final stop, keeping the visual line continuous.
+    for start in range(0, len(coordinate_pairs) - 1, ROAD_LINE_GROUP_SIZE - 1):
+        part = coordinate_pairs[start : start + ROAD_LINE_GROUP_SIZE]
+        segment, uses_road = road_line_segment(part)
+        if full_line and segment:
+            segment = segment[1:]
+        full_line.extend(segment)
+        all_segments_are_road = all_segments_are_road and uses_road
+    return full_line, all_segments_are_road
+
+
+def geographic_seed_order(points: list[dict[str, Any]]) -> list[int]:
+    """Make compact groups for large jobs without making hundreds of API calls."""
+    remaining = set(range(1, len(points)))
+    current = 0
+    order: list[int] = []
+    while remaining:
+        next_stop = min(remaining, key=lambda candidate: haversine_metres(points[current], points[candidate]))
+        order.append(next_stop)
+        remaining.remove(next_stop)
+        current = next_stop
+    return order
+
+
+def create_route_plan(points: list[dict[str, Any]]) -> dict[str, Any]:
+    """Plan a route with road data, grouping large delivery batches safely."""
+    if len(points) <= ROAD_MATRIX_GROUP_SIZE:
+        coordinate_pairs = tuple((point["lat"], point["lon"]) for point in points)
+        matrix = road_distance_matrix(coordinate_pairs)
+        order, method = optimise_stop_order(matrix["distances"])
+        distance_total = sum(
+            matrix["distances"][from_index][to_index]
+            for from_index, to_index in zip((0,) + tuple(order), order)
+        )
+        duration_total = sum(
+            matrix["durations"][from_index][to_index]
+            for from_index, to_index in zip((0,) + tuple(order), order)
+        )
+        return {
+            "order": order,
+            "method": method,
+            "distance_total": distance_total,
+            "duration_total": duration_total,
+            "mode": matrix["mode"],
+        }
+
+    # Public routing servers tend to cap very large table requests.  Grouping lets
+    # a 100+ stop run continue to use road distances inside every delivery group.
+    seed_order = geographic_seed_order(points)
+    current = 0
+    order: list[int] = []
+    distance_total = 0.0
+    duration_total = 0.0
+    all_road = True
+    for start in range(0, len(seed_order), ROAD_MATRIX_GROUP_SIZE - 1):
+        group_indexes = seed_order[start : start + ROAD_MATRIX_GROUP_SIZE - 1]
+        local_indexes = [current] + group_indexes
+        local_points = [points[index] for index in local_indexes]
+        matrix = road_distance_matrix(tuple((point["lat"], point["lon"]) for point in local_points))
+        local_order, _ = optimise_stop_order(matrix["distances"])
+        previous = 0
+        for local_stop in local_order:
+            distance_total += matrix["distances"][previous][local_stop]
+            duration_total += matrix["durations"][previous][local_stop]
+            order.append(local_indexes[local_stop])
+            previous = local_stop
+        current = local_indexes[local_order[-1]]
+        all_road = all_road and matrix["mode"] == "road"
+    return {
+        "order": order,
+        "method": f"Scalable road-based groups ({len(order)} deliveries)",
+        "distance_total": distance_total,
+        "duration_total": duration_total,
+        "mode": "road" if all_road else "approximate",
+    }
 
 
 def make_map(locations: list[dict[str, Any]], path: list[list[float]] | None = None) -> pdk.Deck:
@@ -291,18 +379,22 @@ def make_map(locations: list[dict[str, Any]], path: list[list[float]] | None = N
                 pickable=False,
             )
         )
-    layers.extend(
-        [
-            pdk.Layer(
-                "ScatterplotLayer",
-                data=map_rows,
-                get_position="[lon, lat]",
-                get_fill_color="colour",
-                get_radius=70,
-                radius_min_pixels=7,
-                radius_max_pixels=16,
-                pickable=True,
-            ),
+    layers.append(
+        pdk.Layer(
+            "ScatterplotLayer",
+            data=map_rows,
+            get_position="[lon, lat]",
+            get_fill_color="colour",
+            get_radius=70,
+            radius_min_pixels=7,
+            radius_max_pixels=16,
+            pickable=True,
+        )
+    )
+    # Hundreds of permanent text labels make a phone map unreadable. Pins stay
+    # tappable, and labels remain visible for normal-size jobs.
+    if len(map_rows) <= 30:
+        layers.append(
             pdk.Layer(
                 "TextLayer",
                 data=map_rows,
@@ -311,9 +403,8 @@ def make_map(locations: list[dict[str, Any]], path: list[list[float]] | None = N
                 get_color=[30, 30, 30],
                 get_size=14,
                 get_alignment_baseline="bottom",
-            ),
-        ]
-    )
+            )
+        )
     return pdk.Deck(
         layers=layers,
         initial_view_state=pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=12, pitch=0),
@@ -329,6 +420,22 @@ def values_signature(
     # results if the user changes it after an unsuccessful Google lookup.
     key_fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest() if api_key else ""
     return (start, tuple((parcel["name"], parcel["text"]) for parcel in parcels), provider, country, key_fingerprint)
+
+
+def bulk_parcels(value: str, first_stop_number: int) -> list[dict[str, str]]:
+    """Read mobile-friendly bulk lines: ``Name | location`` or just ``location``."""
+    parcels: list[dict[str, str]] = []
+    for line in value.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "|" in line:
+            name, location = (part.strip() for part in line.split("|", 1))
+        else:
+            name, location = "", line
+        stop_number = first_stop_number + len(parcels)
+        parcels.append({"name": name or f"Stop {stop_number}", "text": location})
+    return parcels
 
 
 def location_card(location: dict[str, Any], title: str, key: str) -> None:
@@ -387,7 +494,14 @@ with st.sidebar:
 if "parcel_count" not in st.session_state:
     st.session_state.parcel_count = 3
 
-parcel_count = st.slider("How many parcels are you delivering?", min_value=1, max_value=10, key="parcel_count")
+parcel_count = st.slider(
+    "Individual parcel boxes",
+    min_value=0,
+    max_value=10,
+    key="parcel_count",
+    help="For more than 10 parcels, use the bulk-paste box below.",
+)
+input_problem = ""
 
 with st.form("delivery_inputs", border=False):
     st.subheader("1. Paste your start location")
@@ -399,7 +513,7 @@ with st.form("delivery_inputs", border=False):
     )
     st.caption("Accepted coordinate examples: `17.4069790, 78.5874740` • `Lat: 17.4069790, Lng: 78.5874740` • any pasted text that contains a coordinate pair.")
 
-    st.subheader("2. Paste each parcel location")
+    st.subheader("2. Paste parcel locations")
     parcels: list[dict[str, str]] = []
     for index in range(parcel_count):
         with st.container(border=True):
@@ -415,7 +529,24 @@ with st.form("delivery_inputs", border=False):
                     height=80,
                     label_visibility="visible" if index == 0 else "collapsed",
                 )
-            parcels.append({"name": parcel_name.strip() or default_name, "text": parcel_text})
+            if parcel_text.strip():
+                parcels.append({"name": parcel_name.strip() or default_name, "text": parcel_text})
+
+    st.markdown("##### Bulk paste 100+ parcel locations")
+    bulk_text = st.text_area(
+        "Bulk locations",
+        placeholder="Customer A | 17.4069790, 78.5874740\nCustomer B | Lat: 17.3850440, Lng: 78.4866710\nCustomer C | Full address, area, city, PIN code",
+        height=220,
+        help="Use one parcel per line. Add a name before a | character, or paste only the location.",
+    )
+    bulk_entries = bulk_parcels(bulk_text, len(parcels) + 1)
+    if len(parcels) + len(bulk_entries) > MAX_TOTAL_PARCELS:
+        input_problem = f"This prototype supports up to {MAX_TOTAL_PARCELS} parcels at once."
+    else:
+        parcels.extend(bulk_entries)
+    st.caption(
+        "You can add up to 250 parcels. Coordinates are fastest. Free address lookups are checked one at a time and may take about one second per address."
+    )
 
     check_locations, optimise_route = st.columns(2)
     with check_locations:
@@ -425,27 +556,28 @@ with st.form("delivery_inputs", border=False):
 
 signature = values_signature(start_text, parcels, provider, country_hint, api_key)
 if check_pressed or optimise_pressed:
-    start_result, parcel_results = resolve_all(start_text, parcels, provider, api_key, country_hint)
-    st.session_state.location_results = {"signature": signature, "start": start_result, "parcels": parcel_results}
-    st.session_state.pop("route_result", None)
+    if input_problem:
+        st.error(input_problem)
+    elif not parcels:
+        st.error("Add at least one parcel location before checking or optimizing.")
+    else:
+        start_result, parcel_results = resolve_all(start_text, parcels, provider, api_key, country_hint)
+        st.session_state.location_results = {"signature": signature, "start": start_result, "parcels": parcel_results}
+        st.session_state.pop("route_result", None)
 
-    if optimise_pressed and start_result.get("ok") and all(result.get("ok") for result in parcel_results):
-        points = [start_result] + parcel_results
-        coordinate_pairs = tuple((point["lat"], point["lon"]) for point in points)
-        with st.spinner("Finding the best road order…"):
-            matrix = road_distance_matrix(coordinate_pairs)
-            order, method = optimise_stop_order(matrix["distances"])
-            ordered_points = [points[0]] + [points[index] for index in order]
-            route_coordinates = tuple((point["lat"], point["lon"]) for point in ordered_points)
-            path, road_line_available = road_line(route_coordinates)
-        st.session_state.route_result = {
-            "signature": signature,
-            "order": order,
-            "matrix": matrix,
-            "method": method,
-            "path": path,
-            "road_line_available": road_line_available,
-        }
+        if optimise_pressed and start_result.get("ok") and all(result.get("ok") for result in parcel_results):
+            points = [start_result] + parcel_results
+            with st.spinner("Finding the best road order…"):
+                plan = create_route_plan(points)
+                ordered_points = [points[0]] + [points[index] for index in plan["order"]]
+                route_coordinates = tuple((point["lat"], point["lon"]) for point in ordered_points)
+                path, road_line_available = road_line(route_coordinates)
+            st.session_state.route_result = {
+                "signature": signature,
+                **plan,
+                "path": path,
+                "road_line_available": road_line_available,
+            }
 
 results = st.session_state.get("location_results")
 if results and results.get("signature") == signature:
@@ -478,12 +610,15 @@ if results and results.get("signature") == signature:
         st.markdown("##### All resolved locations")
         st.pydeck_chart(make_map(valid_locations), use_container_width=True, height=420)
 
-    with st.expander("Show each location and its Google Maps verification link", expanded=False):
-        if start_result.get("ok"):
-            location_card({**start_result, "is_start": True}, "Start", "maps_start")
-        for index, result in enumerate(parcel_results):
-            if result.get("ok"):
-                location_card(result, result["name"], f"maps_parcel_{index}")
+    if len(parcel_results) <= 20:
+        with st.expander("Show each location and its Google Maps verification link", expanded=False):
+            if start_result.get("ok"):
+                location_card({**start_result, "is_start": True}, "Start", "maps_start")
+            for index, result in enumerate(parcel_results):
+                if result.get("ok"):
+                    location_card(result, result["name"], f"maps_parcel_{index}")
+    else:
+        st.info("For a large batch, use the overview map now and the Navigate buttons in the route list after optimization. Individual preview cards are hidden to keep the phone view fast.")
 
     route = st.session_state.get("route_result")
     if route and route.get("signature") == signature:
@@ -495,21 +630,12 @@ if results and results.get("signature") == signature:
             {**point, "name": "Start" if index == 0 else f"{index}. {point['name']}", "is_start": index == 0}
             for index, point in enumerate(ordered_points)
         ]
-        matrix = route["matrix"]
-        distance_total = sum(
-            matrix["distances"][from_index][to_index]
-            for from_index, to_index in zip((0,) + tuple(route["order"]), route["order"])
-        )
-        duration_total = sum(
-            matrix["durations"][from_index][to_index]
-            for from_index, to_index in zip((0,) + tuple(route["order"]), route["order"])
-        )
         distance_box, time_box, method_box = st.columns(3)
-        distance_box.metric("Estimated distance", f"{distance_total / 1000:.1f} km")
-        time_box.metric("Estimated drive time", f"{duration_total / 60:.0f} min")
+        distance_box.metric("Estimated distance", f"{route['distance_total'] / 1000:.1f} km")
+        time_box.metric("Estimated drive time", f"{route['duration_total'] / 60:.0f} min")
         method_box.metric("Route method", route["method"])
 
-        if matrix["mode"] == "approximate":
+        if route["mode"] == "approximate":
             st.warning("The free road-routing service could not be reached, so this order and estimate use straight-line distances. Try again when online before starting.")
         elif not route["road_line_available"]:
             st.info("The order and estimates use roads, but the map line is straight because the road-line preview was unavailable.")
